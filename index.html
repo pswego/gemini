@@ -149,6 +149,11 @@ button{font-family:inherit;cursor:pointer}
 .filechip svg{color:var(--accent)}
 .gen-img{max-width:100%;border-radius:12px;border:1px solid var(--border);margin:.4em 0;display:block}
 .img-dl{margin:.2em 0 .6em;font-size:12.5px}
+.msg-acts{display:flex;gap:6px;margin-top:10px}
+.act-btn{display:inline-flex;align-items:center;gap:6px;background:none;border:1px solid var(--border);
+  color:var(--muted);padding:5px 11px;border-radius:8px;font-family:var(--font-ui);font-size:12.5px;
+  transition:color .15s,border-color .15s}
+.act-btn:hover{color:var(--text);border-color:var(--accent-line)}
 .cursor::after{content:"▍";color:var(--accent);animation:blink 1s steps(2) infinite}
 @keyframes blink{0%,50%{opacity:1}50.01%,100%{opacity:0}}
 .thinking{color:var(--muted);font-size:13.5px;display:flex;align-items:center;gap:8px}
@@ -393,7 +398,7 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
-  doc, collection, getDoc, getDocs, setDoc, updateDoc, writeBatch,
+  doc, collection, getDoc, getDocs, setDoc, updateDoc, deleteDoc, writeBatch,
   query, orderBy, onSnapshot, terminate, clearIndexedDbPersistence
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
@@ -678,6 +683,7 @@ function renderThread(){
     }
     th.appendChild(m);
   });
+  refreshActions();
 }
 function enhanceCode(container){
   container.querySelectorAll("pre code").forEach(code=>{
@@ -868,7 +874,53 @@ async function send(){
   renderThread();scrollBottom();
   persistMsg(c,c.messages.length-1);
   if(!c.title&&text)autoTitle(c,text);
+  await generate(c);
+}
 
+/* ---------- regenerate ---------- */
+async function regenerate(){
+  if(streaming||!current||!current.messages||!current.messages.length)return;
+  if(!S.apiKey){openSettings();toast("먼저 계정 설정에서 API 키를 입력하세요",true);return}
+  const c=current;
+  const last=c.messages[c.messages.length-1];
+  if(last.role==="model"){
+    const idx=c.messages.length-1;
+    c.messages.pop();
+    deleteDoc(msgRef(c.id,idx)).catch(fsErr); // 같은 자리에 새 답변이 저장되므로 삭제를 먼저 큐에 넣음
+    touchConvo(c).catch(fsErr);
+    const blobIds=last.parts.filter(p=>p.inlineData&&p.inlineData.blobId).map(p=>p.inlineData.blobId);
+    if(blobIds.length)deleteBlobs(blobIds).catch(fsErr);
+  }
+  renderThread();scrollBottom();
+  await generate(c);
+}
+async function deleteBlobs(ids){
+  for(const id of ids){
+    const cs=await getDocs(chunkCol(id));
+    const batch=writeBatch(fs);
+    cs.docs.forEach(d=>batch.delete(d.ref));batch.delete(blobRef(id));
+    await batch.commit();blobCache.delete(id);
+  }
+}
+function refreshActions(){
+  document.querySelectorAll("#thread .msg-acts").forEach(x=>x.remove());
+  if(streaming||!current||!current.messages||!current.messages.length)return;
+  const lastNode=$("thread").lastElementChild;
+  if(!lastNode||!lastNode.classList.contains("msg"))return;
+  const lastMsg=current.messages[current.messages.length-1];
+  const row=el("div","msg-acts");
+  const btn=el("button","act-btn");
+  btn.title="이 대화 기록으로 새로운 답변을 생성합니다 (상단에서 고른 모델 사용)";
+  btn.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8M21 3v5h-5"/></svg>';
+  btn.appendChild(document.createTextNode(lastMsg.role==="model"?"다시 생성":"다시 시도"));
+  btn.onclick=regenerate;
+  row.appendChild(btn);
+  lastNode.querySelector(".bubble").appendChild(row);
+}
+
+/* ---------- generate (assistant turn) ---------- */
+async function generate(c){
+  const model=S.model;c.model=model;
   const th=$("thread");const {m,b}=msgNode("model");
   const content=el("div","content cursor");b.appendChild(content);
   const thinking=el("div","thinking");thinking.innerHTML='<span class="dot"></span>생각 중…';
@@ -876,6 +928,7 @@ async function send(){
   th.appendChild(m);scrollBottom();
 
   streaming=true;controller=new AbortController();setSendMode(true);
+  refreshActions();
   const media=[];let acc="";
   const flush=()=>{content.innerHTML=renderMarkdown(acc);enhanceCode(content);};
 
@@ -915,6 +968,7 @@ async function send(){
   }finally{
     streaming=false;controller=null;setSendMode(false);
     updateSend();
+    if(current===c)refreshActions();
   }
 }
 
