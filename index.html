@@ -164,6 +164,12 @@ body.streaming .msg-tools{visibility:hidden}
   resize:none;outline:none;min-height:48px}
 .edit-acts{display:flex;gap:8px;justify-content:flex-end;margin-top:8px}
 .edit-acts .btn{padding:7px 14px;font-size:13px}
+.model-check{display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap}
+.model-check .btn{padding:7px 12px;font-size:13px}
+.model-check .desc{margin:0;flex:1;min-width:160px}
+.avail{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.avail .chip{padding:5px 10px;font-size:12px;font-family:var(--font-mono)}
+.avail .chip.on{border-color:var(--accent-line);color:var(--accent)}
 .cursor::after{content:"▍";color:var(--accent);animation:blink 1s steps(2) infinite}
 @keyframes blink{0%,50%{opacity:1}50.01%,100%{opacity:0}}
 .thinking{color:var(--muted);font-size:13.5px;display:flex;align-items:center;gap:8px}
@@ -356,8 +362,13 @@ body.streaming .msg-tools{visibility:hidden}
     </div>
     <div class="field">
       <label>모델 목록</label>
-      <p class="desc">한 줄에 하나씩. 상단 드롭다운에 나타납니다. 이름에 "image"가 들어가면 이미지 생성 모델로 처리됩니다.</p>
+      <p class="desc">한 줄에 하나씩. 상단 드롭다운에 나타납니다. 이름에 "image"나 "banana"가 들어가면 이미지 생성 모델로 처리됩니다.</p>
       <textarea id="modelList" rows="6"></textarea>
+      <div class="model-check">
+        <button class="btn" id="checkModels" type="button">사용 가능한 모델 확인</button>
+        <span class="desc" id="checkMsg">입력한 API 키로 목록을 검사하고, 없는 모델은 빼줍니다.</span>
+      </div>
+      <div class="avail" id="availModels"></div>
     </div>
     <div class="field">
       <label>시스템 프롬프트 (선택)</label>
@@ -415,7 +426,7 @@ import {
 /* ---------- config ---------- */
 const DEFAULT_MODELS = [
   "gemini-3.6-flash",
-  "gemini-3.1-pro",
+  "gemini-3.1-pro-preview",
   "gemini-3.5-flash-lite",
   "gemini-3-pro-image",
   "gemini-3.1-flash-image"
@@ -423,12 +434,20 @@ const DEFAULT_MODELS = [
 const API_BASE = "https://generativelanguage.googleapis.com/v1beta/models/";
 const LABELS = {
   "gemini-3.6-flash":"3.6 Flash · 기본",
-  "gemini-3.1-pro":"3.1 Pro · 고성능",
+  "gemini-3.1-pro-preview":"3.1 Pro · 고성능",
+  "gemini-4-carbon":"4 Carbon · 최고 성능",
+  "gemini-4-argon":"4 Argon · 고성능",
+  "gemini-4-hydrogen":"4 Hydrogen · 빠름",
+  "gemini-3.8-flash":"3.8 Flash",
+  "gemini-nano-banana-2.1":"이미지 생성 · Nano Banana 2.1",
   "gemini-3.5-flash-lite":"3.5 Flash-Lite · 저비용",
   "gemini-3-pro-image":"이미지 생성 · Pro",
   "gemini-3.1-flash-image":"이미지 생성 · Flash"
 };
-const isImageModel = m => /image/i.test(m);
+const isImageModel = m => /image|banana/i.test(m);
+// 예전 기본값에 있던 잘못된 ID → 실제 ID (계정에 저장된 목록도 자동 수정)
+const MODEL_FIXES = {"gemini-3.1-pro":"gemini-3.1-pro-preview"};
+const fixModel = m => MODEL_FIXES[m]||m;
 
 /* Firestore 문서는 1MB 제한이 있어서, 큰 첨부/생성 이미지는 blobs 컬렉션에 쪼개서 저장 */
 const INLINE_MAX = 100000;   // 이보다 큰 base64는 blob으로 분리
@@ -470,9 +489,12 @@ async function loadUser(){
   const d=snap.exists()?snap.data():{};
   settings.apiKey=d.apiKey||"";
   settings.hadModels=Array.isArray(d.models)&&d.models.length>0;
-  settings.models=settings.hadModels?d.models:[...DEFAULT_MODELS];
+  settings.models=settings.hadModels?[...new Set(d.models.map(fixModel))]:[...DEFAULT_MODELS];
   settings.sys=d.sys||"";
-  settings.model=d.model||"";
+  settings.model=fixModel(d.model||"");
+  if(settings.hadModels&&(settings.models.join()!==d.models.join()||settings.model!==(d.model||""))){
+    await setDoc(userRef(),{models:settings.models,model:settings.model,updatedAt:Date.now()},{merge:true});
+  }
   if(!snap.exists()){
     await setDoc(userRef(),{email:user.email||"",createdAt:Date.now(),updatedAt:Date.now()},{merge:true});
   }
@@ -864,7 +886,61 @@ async function callImage(model,contents,signal){
   return obj?.candidates?.[0]?.content?.parts||[];
 }
 async function readErr(resp){
-  try{const j=await resp.json();return (j.error&&j.error.message)||("HTTP "+resp.status)}catch{return "HTTP "+resp.status}
+  let msg="HTTP "+resp.status;
+  try{const j=await resp.json();if(j.error&&j.error.message)msg=j.error.message}catch{}
+  if(resp.status===404||/is not found|not supported for generateContent/i.test(msg))
+    msg+="\n→ 계정 설정의 「사용 가능한 모델 확인」으로 쓸 수 있는 모델을 골라주세요.";
+  return msg;
+}
+
+/* ---------- 사용 가능한 모델 (ListModels) ---------- */
+async function listModels(key){
+  const out=[];let token="";
+  do{
+    const url="https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key="+encodeURIComponent(key)+(token?"&pageToken="+encodeURIComponent(token):"");
+    const resp=await fetch(url);
+    if(!resp.ok){let m="HTTP "+resp.status;try{const j=await resp.json();if(j.error&&j.error.message)m=j.error.message}catch{}throw new Error(m)}
+    const j=await resp.json();
+    (j.models||[]).forEach(m=>{
+      if((m.supportedGenerationMethods||[]).includes("generateContent"))
+        out.push({id:m.name.replace(/^models\//,""),name:m.displayName||""});
+    });
+    token=j.nextPageToken||"";
+  }while(token);
+  return out;
+}
+async function checkModels(){
+  const key=$("apiKey").value.trim();
+  const msg=$("checkMsg"),box=$("availModels"),btn=$("checkModels");
+  if(!key){msg.textContent="먼저 API 키를 입력하세요.";return}
+  btn.disabled=true;msg.textContent="확인 중…";box.innerHTML="";
+  try{
+    const avail=await listModels(key);
+    const ids=new Set(avail.map(m=>m.id));
+    const cur=$("modelList").value.split("\n").map(s=>fixModel(s.trim())).filter(Boolean);
+    const ok=cur.filter(m=>ids.has(m)),bad=cur.filter(m=>!ids.has(m));
+    $("modelList").value=ok.join("\n");
+    msg.textContent=bad.length?`없는 모델 ${bad.length}개를 뺐어요: ${bad.join(", ")} — 저장을 눌러야 반영돼요.`
+      :"목록의 모델이 모두 사용 가능해요.";
+    const gem=avail.filter(m=>/^gemini-/.test(m.id)&&!/tts|live|embedding|transcribe|native-audio|computer-use|robotics/i.test(m.id));
+    gem.sort((a,b)=>b.id.localeCompare(a.id,undefined,{numeric:true}));
+    const render=()=>{
+      box.innerHTML="";
+      const have=new Set($("modelList").value.split("\n").map(s=>s.trim()).filter(Boolean));
+      gem.forEach(m=>{
+        const c=el("button","chip"+(have.has(m.id)?" on":""));c.type="button";
+        c.textContent=(have.has(m.id)?"✓ ":"+ ")+m.id;c.title=m.name;
+        c.onclick=()=>{
+          const list=$("modelList").value.split("\n").map(s=>s.trim()).filter(Boolean);
+          const i=list.indexOf(m.id);if(i>=0)list.splice(i,1);else list.push(m.id);
+          $("modelList").value=list.join("\n");render();
+        };
+        box.appendChild(c);
+      });
+    };
+    render();
+  }catch(e){msg.textContent="확인 실패: "+e.message}
+  finally{btn.disabled=false}
 }
 
 /* ---------- send ---------- */
@@ -1054,7 +1130,7 @@ async function generate(c){
         persistMsg(c,c.messages.length-1);saved=true;
       }else{content.remove();m.remove()}
     }else{
-      content.innerHTML='<div style="color:var(--danger)">⚠ 오류: '+escapeHtml(err.message)+'</div>';
+      content.innerHTML='<div style="color:var(--danger);white-space:pre-line">⚠ 오류: '+escapeHtml(err.message)+'</div>';
       toast("요청 실패: "+err.message,true);
     }
   }finally{
@@ -1153,6 +1229,8 @@ function openSettings(){
   $("apiKey").value=S.apiKey;
   $("modelList").value=S.models.join("\n");
   $("sysPrompt").value=S.sys;
+  $("availModels").innerHTML="";
+  $("checkMsg").textContent="입력한 API 키로 목록을 검사하고, 없는 모델은 빼줍니다.";
   $("overlay").classList.add("open");
 }
 function closeSettings(){$("overlay").classList.remove("open")}
@@ -1304,6 +1382,7 @@ $("newChat").onclick=newConvo;
 $("openSettings").onclick=openSettings;
 $("cancelSettings").onclick=closeSettings;
 $("saveSettings").onclick=saveSettings;
+$("checkModels").onclick=checkModels;
 $("overlay").onclick=e=>{if(e.target.id==="overlay")closeSettings()};
 $("hamb").onclick=openSidebar;
 $("scrim").onclick=closeSidebar;
